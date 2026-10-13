@@ -38,7 +38,7 @@ ORIG='global_prep_cmd = [{"do":"/usr/local/bin/wake on","undo":"/usr/local/bin/w
 printf 'origin_web_ui_allowed = pc\noutput_name = 0\n%s\n' "$ORIG" > "$T/home/.config/sunshine/sunshine.conf"
 
 export HOME="$T/home" PATH="$T/bin:$PATH" PYTHON=python3
-export VD_SYSFS_DRM="$T/sys" VD_PROC_CMDLINE="$T/cmdline"
+export VD_SYSFS_DRM="$T/sys" VD_PROC_CMDLINE="$T/cmdline" VD_EDID_PATH="$T/firmware/edid/sunshine-vd.bin"
 export XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=GNOME
 
 fails=0
@@ -80,7 +80,7 @@ bash "$ROOT/install.sh" --yes > "$T/install.out" 2>&1 || { cat "$T/install.out";
 conf="$(cat "$HOME/.config/sunshine/sunshine.conf")"
 check "kernel parameters added for DP-3" 'calls | grep -q "grubby --update-kernel=ALL --args=drm.edid_firmware=DP-3:edid/sunshine-vd.bin video=DP-3:e"'
 check "initramfs rebuilt" 'calls | grep -q "sudo dracut -f --regenerate-all"'
-check "EDID installed" 'calls | grep -q "sudo install -D -m 0644 .*sunshine-vd.bin /usr/lib/firmware/edid/sunshine-vd.bin"'
+check "EDID installed" 'calls | grep -q "sudo install -D -m 0644 .*sunshine-vd.bin $VD_EDID_PATH"'
 check "sunshine.conf keeps the user command first" '[[ "$conf" == *"/usr/local/bin/wake on"*"sunshine-vd start"* ]]'
 check "sunshine.conf: capture = kms, output_name = DP-3" '[[ "$conf" == *"capture = kms"* && "$conf" == *"output_name = DP-3"* ]]'
 check "sunshine.conf backed up" 'ls "$HOME/.config/sunshine/" | grep -q "sunshine.conf.bak-sunshine-vd-"'
@@ -104,7 +104,7 @@ reset_calls
 bash "$ROOT/uninstall.sh" --yes > "$T/uninstall.out" 2>&1 || { cat "$T/uninstall.out"; exit 1; }
 conf="$(cat "$HOME/.config/sunshine/sunshine.conf")"
 check "uninstall: kernel parameters removed" 'calls | grep -q "grubby --update-kernel=ALL --remove-args=drm.edid_firmware=DP-3:edid/sunshine-vd.bin video=DP-3:e"'
-check "uninstall: EDID and dracut config removed" 'calls | grep -q "sudo rm -f /usr/lib/firmware/edid/sunshine-vd.bin /etc/dracut.conf.d/90-sunshine-vd.conf"'
+check "uninstall: EDID and dracut config removed" 'calls | grep -q "sudo rm -f $VD_EDID_PATH /etc/dracut.conf.d/90-sunshine-vd.conf"'
 check "uninstall: user command kept, ours removed" '[[ "$conf" == *"/usr/local/bin/wake on"* && "$conf" != *"sunshine-vd"* ]]'
 check "uninstall: output_name restored, capture removed" '[[ "$conf" == *"output_name = 0"* && "$conf" != *"capture"* ]]'
 check "uninstall: helper and settings removed" '[ ! -e "$HOME/.local/bin/sunshine-vd" ] && [ ! -e "$HOME/.config/sunshine-vd" ]'
