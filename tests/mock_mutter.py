@@ -150,13 +150,15 @@ def apply(st, serial, method, lms, props):
 def on_call(conn, sender, path, iface, method, params, inv):
     st = load()
     try:
+        reply = None
         if method == "GetCurrentState":
-            inv.return_value(get_current_state(st))
+            reply = get_current_state(st)
         elif method == "ApplyMonitorsConfig":
             serial, m, lms, props = params.unpack()
             apply(st, serial, m, lms, props)
-            inv.return_value(None)
+        # Save before replying: once the caller has its answer, the test may read the file.
         save(st)
+        inv.return_value(reply)
     except ConfigError as e:
         save(st)
         inv.return_dbus_error("org.freedesktop.DBus.Error.InvalidArgs", str(e))
