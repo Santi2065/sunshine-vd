@@ -1,0 +1,62 @@
+name: Bug report
+description: Something does not work as described
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please run `sunshine-vd doctor` first and paste its output below.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution and version
+      placeholder: Fedora 45 Workstation
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver version
+      description: "`nvidia-smi --query-gpu=name,driver_version --format=csv,noheader`, or `lspci | grep -i vga` for AMD/Intel"
+      placeholder: NVIDIA GeForce RTX 3070, 615.78.08
+    validations:
+      required: true
+  - type: input
+    id: gnome
+    attributes:
+      label: GNOME version
+      description: "`gnome-shell --version`"
+    validations:
+      required: true
+  - type: input
+    id: sunshine
+    attributes:
+      label: Sunshine version and how it is installed
+      placeholder: 2026.914.233613, RPM from COPR
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: Client device and the resolution/FPS it requests
+      placeholder: Steam Deck OLED, Moonlight 1280x800 @ 90
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `sunshine-vd doctor`
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: "`~/.local/state/sunshine-vd/sunshine-vd.log` and `~/.config/sunshine/sunshine.log` (around the time of the problem)"
+      render: shell

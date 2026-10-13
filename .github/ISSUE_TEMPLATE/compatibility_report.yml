@@ -1,0 +1,43 @@
+name: Compatibility report
+description: Tell us whether sunshine-vd works on your setup (it helps a lot, even if everything worked)
+labels: [compatibility]
+body:
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - Works
+        - Works with workarounds
+        - Does not work
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution and version
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU, driver version and the connector used
+      placeholder: AMD RX 7800 XT, Mesa 25.2, DP-3
+    validations:
+      required: true
+  - type: input
+    id: gnome
+    attributes:
+      label: GNOME version
+    validations:
+      required: true
+  - type: input
+    id: clients
+    attributes:
+      label: Clients you tried
+      placeholder: Android tablet 2560x1600@120, LG TV 1080p60
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes (workarounds, `sunshine-vd doctor` output if something failed)
+      render: shell

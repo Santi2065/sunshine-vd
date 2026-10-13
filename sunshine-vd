@@ -1,0 +1,1352 @@
+#!/usr/bin/env python3
+# sunshine-vd — on-demand virtual display for Sunshine on GNOME (Wayland).
+#
+# How it works
+#   * The kernel force-enables a free connector on the GPU and loads a custom
+#     EDID on it (drm.edid_firmware=<conn>:edid/sunshine-vd.bin video=<conn>:e).
+#     GNOME sees it as one more monitor offering your clients' resolutions.
+#   * Sunshine runs "sunshine-vd start" (global_prep_cmd "do") when a stream
+#     starts: the current display layout is saved, the virtual display becomes
+#     the only active output in the mode closest to what the client asked for,
+#     and GNOME is kept from blanking the screen.
+#   * Sunshine runs "sunshine-vd stop" (global_prep_cmd "undo") when the app is
+#     closed: the saved layout is restored.
+#
+# Subcommands: start | stop | idle | save-layout | status | modes | connectors |
+#              doctor | make-edid | sunshine-conf | conf-path | conf-get
+#
+# "start" and "stop" ALWAYS exit 0: if something goes wrong, Sunshine still
+# streams (whatever display is active) instead of refusing to launch.
+#
+# SPDX-License-Identifier: MIT
+
+import argparse
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+VERSION = "0.1.0"
+
+HOME = Path.home()
+CONFIG_FILE = HOME / ".config" / "sunshine-vd" / "config"
+LOG_FILE = HOME / ".local" / "state" / "sunshine-vd" / "sunshine-vd.log"
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+STATE_FILE = RUNTIME_DIR / "sunshine-vd" / "state.json"
+LAYOUT_FILE = HOME / ".config" / "sunshine-vd" / "layout.json"
+MONITORS_XML = HOME / ".config" / "monitors.xml"
+DEFAULT_SUNSHINE_CONF = HOME / ".config" / "sunshine" / "sunshine.conf"
+EDID_NAME = "sunshine-vd.bin"
+EDID_PATH = Path("/usr/lib/firmware/edid") / EDID_NAME
+INHIBIT_UNIT = "sunshine-vd-inhibit"
+
+# Overridable for tests.
+SYSFS_DRM = Path(os.environ.get("VD_SYSFS_DRM", "/sys/class/drm"))
+PROC_CMDLINE = Path(os.environ.get("VD_PROC_CMDLINE", "/proc/cmdline"))
+
+DEFAULT_CONFIG = {
+    "CONNECTOR": "",            # e.g. DP-3 (written by the installer)
+    "DISABLE_PHYSICAL": "true", # true: only the virtual display while streaming
+    "SCALE": "auto",            # auto | 1 | 2 | 1.5 ...
+    "WAKE_DISPLAYS": "true",    # wake displays if GNOME blanked them
+    "INHIBIT_IDLE": "true",     # keep GNOME from blanking/locking mid-stream
+    "SETTLE_SECONDS": "1.5",    # wait after the mode change, before capture
+    "SUNSHINE_CONF": "",        # empty: ~/.config/sunshine/sunshine.conf
+}
+
+# Default EDID modes. The first one is the preferred mode. They cover the
+# usual clients: TVs (16:9), tablets (16:10), the Steam Deck (1280x800) and
+# phones (20:9). Override with MODES=... at install time.
+DEFAULT_MODES = (
+    "1920x1080@60,1920x1080@120,2560x1440@60,2560x1440@120,3840x2160@60,"
+    "1280x720@60,2560x1600@60,1280x800@60,1280x800@90,2400x1080@60,2400x1080@120"
+)
+
+GPU_VENDORS = {"0x10de": "NVIDIA", "0x1002": "AMD", "0x8086": "Intel"}
+
+# ------------------------------------------------------------------ helpers
+
+
+def log(msg, also_stderr=True):
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > 512 * 1024:
+            LOG_FILE.replace(LOG_FILE.with_suffix(".log.1"))
+        with LOG_FILE.open("a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+    if also_stderr:
+        print(msg, file=sys.stderr)
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        for raw in CONFIG_FILE.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            cfg[k.strip()] = v.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        pass
+    return cfg
+
+
+def truthy(v):
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def sunshine_conf_path(cfg=None):
+    cfg = cfg or load_config()
+    p = os.environ.get("SUNSHINE_CONF") or cfg.get("SUNSHINE_CONF") or ""
+    return Path(p).expanduser() if p else DEFAULT_SUNSHINE_CONF
+
+
+def read_text(path, default=""):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return default
+
+
+# ------------------------------------------------------------ EDID builder
+
+# CTA-861 VICs used for exact matches (saves detailed-timing slots):
+# (width, height, refresh) -> (vic, pixel_clock_MHz, h_total, v_total)
+CTA_VICS = {
+    (1280, 720, 60): (4, 74.25, 1650, 750),
+    (1920, 1080, 60): (16, 148.5, 2200, 1125),
+    (1920, 1080, 120): (63, 297.0, 2200, 1125),
+    (3840, 2160, 30): (95, 297.0, 4400, 2250),
+    (3840, 2160, 60): (97, 594.0, 4400, 2250),
+}
+
+
+def parse_modes(spec):
+    modes = []
+    for item in spec.replace(" ", "").split(","):
+        if not item:
+            continue
+        m = re.fullmatch(r"(\d+)x(\d+)@(\d+(?:\.\d+)?)", item)
+        if not m:
+            raise ValueError(f"invalid mode {item!r} (expected e.g. 1920x1080@60)")
+        w, h, r = int(m.group(1)), int(m.group(2)), float(m.group(3))
+        if not (320 <= w <= 4095 and 200 <= h <= 4095 and 23 <= r <= 240):
+            raise ValueError(f"mode out of range: {item}")
+        if (w, h, r) not in modes:
+            modes.append((w, h, r))
+    if not modes:
+        raise ValueError("no modes given")
+    return modes
+
+
+def cvt_rb_timing(w, h, refresh):
+    """CVT Reduced Blanking v1 timings (VESA CVT 1.2)."""
+    H_BLANK, H_SYNC, H_FPORCH = 160, 32, 48
+    RB_MIN_V_BLANK_US, RB_V_FPORCH, MIN_V_BPORCH = 460.0, 3, 6
+    ratio = w / h
+    vsync = 10
+    for a, b, vs in ((4, 3, 4), (16, 9, 5), (16, 10, 6), (5, 4, 7), (15, 9, 7)):
+        if abs(ratio - a / b) < 0.01:
+            vsync = vs
+            break
+    h_period_est = ((1e6 / refresh) - RB_MIN_V_BLANK_US) / h
+    vbi_lines = int(RB_MIN_V_BLANK_US / h_period_est) + 1
+    vblank = max(vbi_lines, RB_V_FPORCH + vsync + MIN_V_BPORCH)
+    h_total = w + H_BLANK
+    v_total = h + vblank
+    # Clock in 10 kHz units (DTD resolution), rounded so the real refresh rate
+    # lands as close as possible to the requested one.
+    clock_10khz = round(refresh * h_total * v_total / 1e4)
+    return {
+        "w": w, "h": h,
+        "hblank": H_BLANK, "hfp": H_FPORCH, "hsync": H_SYNC,
+        "vblank": vblank, "vfp": RB_V_FPORCH, "vsync": vsync,
+        "h_total": h_total, "v_total": v_total,
+        "clock_10khz": clock_10khz,
+        "clock_mhz": clock_10khz / 100.0,
+        "refresh_real": clock_10khz * 1e4 / (h_total * v_total),
+        "hfreq_khz": clock_10khz * 1e4 / h_total / 1e3,
+    }
+
+
+def mm_at_96dpi(px):
+    return max(1, round(px * 25.4 / 96))
+
+
+def encode_dtd(t, size_mm):
+    hw, hh = size_mm
+    limits = {
+        "clock_10khz": (1, 0xFFFF), "w": (1, 4095), "hblank": (0, 4095),
+        "h": (1, 4095), "vblank": (0, 4095), "hfp": (0, 1023),
+        "hsync": (0, 1023), "vfp": (0, 63), "vsync": (0, 63),
+    }
+    for k, (lo, hi) in limits.items():
+        if not lo <= t[k] <= hi:
+            raise ValueError(f"{t['w']}x{t['h']}: {k}={t[k]} does not fit in a DTD")
+    d = bytearray(18)
+    d[0] = t["clock_10khz"] & 0xFF
+    d[1] = (t["clock_10khz"] >> 8) & 0xFF
+    d[2] = t["w"] & 0xFF
+    d[3] = t["hblank"] & 0xFF
+    d[4] = ((t["w"] >> 8) & 0xF) << 4 | ((t["hblank"] >> 8) & 0xF)
+    d[5] = t["h"] & 0xFF
+    d[6] = t["vblank"] & 0xFF
+    d[7] = ((t["h"] >> 8) & 0xF) << 4 | ((t["vblank"] >> 8) & 0xF)
+    d[8] = t["hfp"] & 0xFF
+    d[9] = t["hsync"] & 0xFF
+    d[10] = (t["vfp"] & 0xF) << 4 | (t["vsync"] & 0xF)
+    d[11] = (((t["hfp"] >> 8) & 3) << 6 | ((t["hsync"] >> 8) & 3) << 4
+             | ((t["vfp"] >> 4) & 3) << 2 | ((t["vsync"] >> 4) & 3))
+    d[12] = hw & 0xFF
+    d[13] = hh & 0xFF
+    d[14] = ((hw >> 8) & 0xF) << 4 | ((hh >> 8) & 0xF)
+    d[15] = 0
+    d[16] = 0
+    d[17] = 0x1A  # digital separate sync, +hsync -vsync (CVT-RB)
+    return bytes(d)
+
+
+def text_descriptor(tag, text):
+    raw = text.encode("ascii", "replace")[:13]
+    if len(raw) < 13:
+        raw += b"\n" + b" " * (12 - len(raw))
+    return bytes([0, 0, 0, tag, 0]) + raw
+
+
+def checksum(block):
+    return (256 - sum(block[:127]) % 256) % 256
+
+
+def manufacturer_id(code):
+    v = 0
+    for ch in code.upper():
+        v = (v << 5) | (ord(ch) - ord("A") + 1)
+    return v.to_bytes(2, "big")
+
+
+def chroma_bytes():
+    # sRGB primaries: R, G, B, white
+    xs = [0.640, 0.330, 0.300, 0.600, 0.150, 0.060, 0.3127, 0.3290]
+    v = [round(x * 1024) for x in xs]
+    lo1 = (v[0] & 3) << 6 | (v[1] & 3) << 4 | (v[2] & 3) << 2 | (v[3] & 3)
+    lo2 = (v[4] & 3) << 6 | (v[5] & 3) << 4 | (v[6] & 3) << 2 | (v[7] & 3)
+    return bytes([lo1, lo2] + [x >> 2 for x in v])
+
+
+def build_edid(modes, name="Sunshine VD", serial=1):
+    """Return (256-byte EDID, list of human-readable mode descriptions).
+
+    Layout: EDID 1.4 base block (2 DTDs + name + range limits) and one
+    CTA-861 extension (VICs for standard modes + up to 6 more DTDs). The
+    first mode is always a DTD so it becomes the preferred/native mode.
+    """
+    # One physical size for every mode (the preferred mode at 96 dpi), like a
+    # real monitor.
+    size_mm = (mm_at_96dpi(modes[0][0]), mm_at_96dpi(modes[0][1]))
+    dtds, vics, summary = [], [], []
+    rates = [(31.469, 59.94, 25.175)]  # 640x480@60 (established timing)
+    for i, (w, h, r) in enumerate(modes):
+        key = (w, h, int(round(r)))
+        if i > 0 and abs(r - round(r)) < 1e-6 and key in CTA_VICS:
+            vic, clk, ht, vt = CTA_VICS[key]
+            if vic not in vics:
+                vics.append(vic)
+            rates.append((clk * 1e3 / ht, clk * 1e6 / (ht * vt), clk))
+            summary.append(f"{w}x{h}@{r:g} (CTA VIC {vic}, {clk:.2f} MHz)")
+            continue
+        t = cvt_rb_timing(w, h, r)
+        if t["clock_mhz"] > 655.35:
+            raise ValueError(f"{w}x{h}@{r:g} needs a {t['clock_mhz']:.1f} MHz pixel clock "
+                             "(a DTD allows at most 655.35 MHz)")
+        dtds.append(encode_dtd(t, size_mm))
+        rates.append((t["hfreq_khz"], t["refresh_real"], t["clock_mhz"]))
+        summary.append(f"{w}x{h}@{r:g} (DTD, {t['clock_mhz']:.2f} MHz, "
+                       f"{t['refresh_real']:.3f} Hz actual)")
+
+    base_dtds, ext_dtds = dtds[:2], dtds[2:]
+    if len(vics) > 31:
+        raise ValueError("too many VICs")
+
+    # ---- base block (EDID 1.4)
+    b = bytearray(128)
+    b[0:8] = b"\x00\xff\xff\xff\xff\xff\xff\x00"
+    b[8:10] = manufacturer_id("LNX")
+    b[10:12] = (0x5644).to_bytes(2, "little")      # product code "VD"
+    b[12:16] = int(serial).to_bytes(4, "little")
+    b[16] = 1                                        # week
+    b[17] = 2026 - 1990                              # year
+    b[18], b[19] = 1, 4                              # EDID 1.4
+    b[20] = 0xA5                                     # digital, 8 bpc, DisplayPort
+    b[21] = min(255, round(size_mm[0] / 10))
+    b[22] = min(255, round(size_mm[1] / 10))
+    b[23] = 120                                      # gamma 2.2
+    b[24] = 0x06                                     # RGB 4:4:4, sRGB, preferred = native
+    b[25:35] = chroma_bytes()
+    b[35], b[36], b[37] = 0x20, 0x00, 0x00           # 640x480@60
+    b[38:54] = b"\x01\x01" * 8                       # no standard timings
+
+    hmin = max(1, math.floor(min(r[0] for r in rates)) - 1)
+    hmax = math.ceil(max(r[0] for r in rates)) + 1
+    vmin = 24
+    vmax = max(61, math.ceil(max(r[1] for r in rates)) + 1)
+    maxclk = math.ceil(max(r[2] for r in rates) / 10) + 1
+    offsets = 0
+    if hmax > 255:
+        offsets |= 0x08
+        hmax -= 255
+    if vmax > 255:
+        offsets |= 0x02
+        vmax -= 255
+    if maxclk > 255:
+        raise ValueError("maximum pixel clock too high")
+    range_desc = bytes([0, 0, 0, 0xFD, offsets, vmin, vmax, hmin, hmax, maxclk,
+                        0x01, 0x0A, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20])
+
+    descs = list(base_dtds)
+    descs.append(text_descriptor(0xFC, name))
+    descs.append(range_desc)
+    if len(descs) < 4:  # a single DTD: fill the free slot with a dummy descriptor
+        descs.insert(1, bytes([0, 0, 0, 0x10]) + bytes(14))
+    for i, d in enumerate(descs[:4]):
+        b[54 + 18 * i: 72 + 18 * i] = d
+    b[126] = 1
+    b[127] = checksum(b)
+
+    # ---- CTA-861 extension (rev 3)
+    e = bytearray(128)
+    e[0], e[1] = 0x02, 0x03
+    dbc = bytes([(2 << 5) | len(vics)] + vics) if vics else b""
+    # Video Capability Data Block: selectable RGB range, always underscanned.
+    dbc += bytes([(7 << 5) | 2, 0x00, 0x4A])
+    dtd_off = 4 + len(dbc)
+    room = (127 - dtd_off) // 18
+    if len(ext_dtds) > room:
+        raise ValueError(f"too many modes: at most {2 + room} modes can have their own "
+                         f"timing and {len(dtds)} were given (standard TV modes like "
+                         "1920x1080@60/120, 3840x2160@60 or 1280x720@60 are free)")
+    e[2] = dtd_off
+    e[3] = 0x81  # underscanned; 1 native DTD (the preferred one)
+    e[4:4 + len(dbc)] = dbc
+    off = dtd_off
+    for d in ext_dtds:
+        e[off:off + 18] = d
+        off += 18
+    e[127] = checksum(e)
+    return bytes(b) + bytes(e), summary
+
+
+def cmd_make_edid(args):
+    try:
+        modes = parse_modes(args.modes)
+        data, summary = build_edid(modes, name=args.name)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.out == "-":
+        sys.stdout.buffer.write(data)
+    else:
+        Path(args.out).write_bytes(data)
+        print(f"EDID written to {args.out} ({len(data)} bytes). Modes:")
+        for i, s in enumerate(summary):
+            print(f"  {'*' if i == 0 else ' '} {s}")
+    return 0
+
+
+# ---------------------------------------------------------- DRM connectors
+
+
+def list_connectors():
+    out = []
+    for d in sorted(SYSFS_DRM.glob("card*-*")):
+        if not (d / "status").exists():
+            continue
+        card, name = d.name.split("-", 1)
+        if name.startswith("Writeback"):
+            continue
+        vendor = read_text(SYSFS_DRM / card / "device" / "vendor")
+        out.append({
+            "card": card, "name": name,
+            "status": read_text(d / "status", "unknown"),
+            "enabled": read_text(d / "enabled", "?"),
+            "vendor": GPU_VENDORS.get(vendor, vendor or "?"),
+        })
+    return out
+
+
+def forced_connector():
+    m = re.search(rf"drm\.edid_firmware=([^:\s]+):edid/{re.escape(EDID_NAME)}",
+                  read_text(PROC_CMDLINE))
+    return m.group(1) if m else ""
+
+
+def _connector_number(name):
+    try:
+        return int(name.rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        return -1
+
+
+def busy_names(conns):
+    """Names the kernel parameters must not target: connected on any GPU, or
+    present on more than one GPU (drm.edid_firmware/video= match by name on
+    every DRM device)."""
+    seen, busy = {}, set()
+    for c in conns:
+        seen[c["name"]] = seen.get(c["name"], 0) + 1
+        if c["status"] == "connected":
+            busy.add(c["name"])
+    return busy | {n for n, k in seen.items() if k > 1}
+
+
+def pick_connector(conns):
+    """Highest-numbered free DisplayPort, else highest-numbered free HDMI."""
+    busy = busy_names(conns)
+    free = [c for c in conns if c["name"] not in busy]
+    for prefix in ("DP-", "HDMI-"):
+        cands = [c for c in free if c["name"].startswith(prefix)]
+        if cands:
+            return max(cands, key=lambda c: _connector_number(c["name"]))["name"]
+    return ""
+
+
+def cmd_connectors(args):
+    conns = list_connectors()
+    forced = forced_connector()
+    if args.validate:
+        same = [c for c in conns if c["name"] == args.validate]
+        if not same:
+            return 2
+        if args.validate == forced:
+            return 0
+        if len(same) > 1:
+            return 4
+        if same[0]["status"] == "connected":
+            return 3
+        return 0
+    if args.pick:
+        name = forced or pick_connector(conns)
+        if not name:
+            return 1
+        print(name)
+        return 0
+    if args.json:
+        print(json.dumps({"connectors": conns, "forced": forced,
+                          "suggested": forced or pick_connector(conns)}, indent=1))
+        return 0
+    if not conns:
+        print(f"No DRM connectors found under {SYSFS_DRM}")
+        return 1
+    suggested = pick_connector(conns)
+    counts = {}
+    for c in conns:
+        counts[c["name"]] = counts.get(c["name"], 0) + 1
+    print(f"{'CONNECTOR':<12} {'STATUS':<13} {'ENABLED':<9} GPU")
+    for c in conns:
+        note = ""
+        if c["name"] == forced:
+            note = "  <- virtual display (sunshine-vd)"
+        elif not forced and c["name"] == suggested:
+            note = "  <- the installer would use this one"
+        elif counts[c["name"]] > 1:
+            note = "  (same name on another GPU: cannot be used)"
+        print(f"{c['name']:<12} {c['status']:<13} {c['enabled']:<9} {c['card']} {c['vendor']}{note}")
+    return 0
+
+
+# ------------------------------------------------------------ Mutter D-Bus
+
+
+class Mutter:
+    BUS_NAME = "org.gnome.Mutter.DisplayConfig"
+    PATH = "/org/gnome/Mutter/DisplayConfig"
+    IFACE = "org.gnome.Mutter.DisplayConfig"
+
+    def __init__(self):
+        if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+            os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={RUNTIME_DIR}/bus"
+        import gi
+        gi.require_version("Gio", "2.0")
+        gi.require_version("GLib", "2.0")
+        from gi.repository import Gio, GLib
+        self.Gio, self.GLib = Gio, GLib
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+
+    def _call(self, method, params=None, reply="()"):
+        Gio, GLib = self.Gio, self.GLib
+        res = self.bus.call_sync(self.BUS_NAME, self.PATH, self.IFACE, method,
+                                 params, GLib.VariantType(reply),
+                                 Gio.DBusCallFlags.NONE, 10000, None)
+        return res.unpack()
+
+    def state(self):
+        serial, monitors, logical, props = self._call(
+            "GetCurrentState", None,
+            "(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})")
+        return parse_state(serial, monitors, logical, props)
+
+    def apply(self, logical_monitors, method, layout_mode=None):
+        """logical_monitors: list of {x, y, scale, transform, primary, monitors: [(conn, mode_id)]}.
+        method: 0 verify, 1 temporary, 2 persistent (GNOME asks the user to confirm)."""
+        GLib = self.GLib
+        st = self.state()
+        props = {}
+        if layout_mode is not None and st["supports_layout_mode"]:
+            props["layout-mode"] = GLib.Variant("u", int(layout_mode))
+        lms = [(int(lm["x"]), int(lm["y"]), float(lm["scale"]), int(lm.get("transform", 0)),
+                bool(lm["primary"]), [(c, mid, {}) for (c, mid) in lm["monitors"]])
+               for lm in logical_monitors]
+        params = GLib.Variant("(uua(iiduba(ssa{sv}))a{sv})",
+                              (st["serial"], int(method), lms, props))
+        self._call("ApplyMonitorsConfig", params, "()")
+
+    def get_power_save(self):
+        GLib = self.GLib
+        v = self.bus.call_sync(self.BUS_NAME, self.PATH, "org.freedesktop.DBus.Properties", "Get",
+                               GLib.Variant("(ss)", (self.IFACE, "PowerSaveMode")),
+                               GLib.VariantType("(v)"), self.Gio.DBusCallFlags.NONE, 5000, None)
+        return v.unpack()[0]
+
+    def set_power_save(self, mode):
+        GLib = self.GLib
+        self.bus.call_sync(self.BUS_NAME, self.PATH, "org.freedesktop.DBus.Properties", "Set",
+                           GLib.Variant("(ssv)", (self.IFACE, "PowerSaveMode", GLib.Variant("i", mode))),
+                           None, self.Gio.DBusCallFlags.NONE, 5000, None)
+
+
+def parse_state(serial, monitors, logical, props):
+    mons = []
+    for (spec, modes, mprops) in monitors:
+        conn, vendor, product, mserial = spec
+        mlist = []
+        for (mid, w, h, refresh, pref_scale, scales, mp) in modes:
+            mlist.append({
+                "id": mid, "width": w, "height": h, "refresh": refresh,
+                "preferred_scale": pref_scale, "scales": list(scales),
+                "current": bool(mp.get("is-current", False)),
+                "preferred": bool(mp.get("is-preferred", False)),
+                "interlaced": bool(mp.get("is-interlaced", False)),
+            })
+        mons.append({
+            "connector": conn, "vendor": vendor, "product": product, "serial": mserial,
+            "display_name": mprops.get("display-name", f"{vendor} {product}"),
+            "builtin": bool(mprops.get("is-builtin", False)),
+            "modes": mlist,
+        })
+    lms = []
+    for (x, y, scale, transform, primary, specs, _lp) in logical:
+        lms.append({"x": x, "y": y, "scale": scale, "transform": transform,
+                    "primary": bool(primary), "connectors": [s[0] for s in specs]})
+    return {
+        "serial": serial,
+        "monitors": mons,
+        "logical": lms,
+        "layout_mode": int(props.get("layout-mode", 1)),
+        "supports_layout_mode": bool(props.get("supports-changing-layout-mode", False)),
+    }
+
+
+def find_monitor(st, connector):
+    for m in st["monitors"]:
+        if m["connector"] == connector:
+            return m
+    return None
+
+
+def current_mode(mon):
+    for md in mon["modes"]:
+        if md["current"]:
+            return md
+    return None
+
+
+def preferred_mode(mon):
+    for md in mon["modes"]:
+        if md["preferred"]:
+            return md
+    return mon["modes"][0] if mon["modes"] else None
+
+
+def choose_mode(modes, w, h, fps):
+    """Pick the virtual-display mode that best matches the client's request.
+
+    1) closest aspect ratio (1 % tolerance); 2) prefer resolutions that reach
+    the requested refresh rate (for games, fps matter more than a few extra
+    pixels); 3) the smallest resolution that covers the request (downscaling
+    beats upscaling) or, if none does, the largest; 4) the same refresh rate
+    or the next one up.
+    """
+    cands = [m for m in modes if not m.get("interlaced")]
+    # Ignore the 640x480 mode every EDID must carry (and anything that small).
+    cands = [m for m in cands if m["width"] >= 800] or cands
+    if not cands:
+        return None
+    want_ar = w / h
+
+    def ar_err(m):
+        return abs(math.log((m["width"] / m["height"]) / want_ar))
+
+    best_err = min(ar_err(m) for m in cands)
+    group = [m for m in cands if ar_err(m) <= best_err + 0.01]
+
+    fast_res = {(m["width"], m["height"]) for m in group if m["refresh"] >= fps - 0.5}
+    if fast_res:
+        group = [m for m in group if (m["width"], m["height"]) in fast_res]
+
+    covering = [m for m in group if m["width"] >= 0.95 * w and m["height"] >= 0.95 * h]
+    if covering:
+        best = min(covering, key=lambda m: m["width"] * m["height"])
+    else:
+        best = max(group, key=lambda m: m["width"] * m["height"])
+    pool = [m for m in group if (m["width"], m["height"]) == (best["width"], best["height"])]
+
+    def rate_key(m):
+        below = 0 if m["refresh"] >= fps - 0.5 else 1
+        return (below, abs(m["refresh"] - fps))
+
+    return min(pool, key=rate_key)
+
+
+def choose_scale(mode, wanted):
+    scales = mode.get("scales") or [1.0]
+    if wanted not in ("", "auto"):
+        try:
+            target = float(wanted)
+        except ValueError:
+            target = 1.0
+    else:
+        target = 2.0 if mode["height"] >= 2000 else 1.0
+    return min(scales, key=lambda s: (abs(s - target), s))
+
+
+def logical_size(mode, scale, layout_mode):
+    if layout_mode == 2:  # physical layout mode
+        return mode["width"], mode["height"]
+    return round(mode["width"] / scale), round(mode["height"] / scale)
+
+
+def snapshot(st):
+    """The current layout, in a form that can be re-applied later."""
+    lms = []
+    for lm in st["logical"]:
+        mons = []
+        for c in lm["connectors"]:
+            mon = find_monitor(st, c)
+            md = current_mode(mon) if mon else None
+            if md:
+                mons.append([c, md["id"], md["width"], md["height"], md["refresh"]])
+        if mons:
+            lms.append({"x": lm["x"], "y": lm["y"], "scale": lm["scale"],
+                        "transform": lm["transform"], "primary": lm["primary"],
+                        "monitors": mons})
+    return {"layout_mode": st["layout_mode"], "logical": lms}
+
+
+def snapshot_to_config(snap, st, exclude=()):
+    """Adapt a snapshot to the current state (monitors gone, mode ids changed)."""
+    out = []
+    for lm in snap["logical"]:
+        mons = []
+        for (c, mid, w, h, r) in lm["monitors"]:
+            if c in exclude:
+                continue
+            mon = find_monitor(st, c)
+            if not mon:
+                continue
+            ids = {m["id"] for m in mon["modes"]}
+            if mid not in ids:
+                same = [m for m in mon["modes"] if m["width"] == w and m["height"] == h]
+                md = min(same, key=lambda m: abs(m["refresh"] - r)) if same else preferred_mode(mon)
+                if not md:
+                    continue
+                mid = md["id"]
+            mons.append((c, mid))
+        if mons:
+            out.append({"x": lm["x"], "y": lm["y"], "scale": lm["scale"],
+                        "transform": lm["transform"], "primary": lm["primary"],
+                        "monitors": mons})
+    if out and not any(lm["primary"] for lm in out):
+        out[0]["primary"] = True
+    return normalize(out)
+
+
+def normalize(lms):
+    """Shift a layout so it starts at (0, 0): Mutter rejects offset layouts,
+    which is what is left when the virtual display is removed from the left."""
+    if not lms:
+        return lms
+    dx = min(lm["x"] for lm in lms)
+    dy = min(lm["y"] for lm in lms)
+    for lm in lms:
+        lm["x"] -= dx
+        lm["y"] -= dy
+    return lms
+
+
+def has_other_monitors(snap, conn):
+    return any(m[0] != conn for lm in (snap or {}).get("logical", []) for m in lm["monitors"])
+
+
+def linear_config(st, exclude=(), layout_mode=None):
+    """Every connected monitor (minus the excluded ones) side by side."""
+    layout_mode = st["layout_mode"] if layout_mode is None else layout_mode
+    out, x = [], 0
+    for mon in st["monitors"]:
+        if mon["connector"] in exclude:
+            continue
+        md = preferred_mode(mon)
+        if not md:
+            continue
+        scale = md["preferred_scale"] if md["preferred_scale"] in md["scales"] else 1.0
+        out.append({"x": x, "y": 0, "scale": scale, "transform": 0,
+                    "primary": not out, "monitors": [(mon["connector"], md["id"])]})
+        x += logical_size(md, scale, layout_mode)[0]
+    return out
+
+
+# --------------------------------------------------------- start / stop
+
+
+def read_state():
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def write_state(data):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=1))
+    tmp.replace(STATE_FILE)
+
+
+def sysfs_connector_enabled(connector):
+    for p in SYSFS_DRM.glob(f"card*-{connector}"):
+        try:
+            return (p / "enabled").read_text().strip() == "enabled"
+        except OSError:
+            return None
+    return None
+
+
+def run_quiet(cmd, timeout=10):
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(cmd, 1, str(exc))
+
+
+def start_inhibitor():
+    if not shutil.which("gnome-session-inhibit"):
+        log("warning: gnome-session-inhibit not found; GNOME may blank the screen mid-stream")
+        return
+    if run_quiet(["systemctl", "--user", "is-active", "--quiet", INHIBIT_UNIT]).returncode == 0:
+        return
+    r = run_quiet(["systemd-run", "--user", "--quiet", "--collect", f"--unit={INHIBIT_UNIT}",
+                   "gnome-session-inhibit", "--inhibit", "idle:suspend",
+                   "--app-id", "sunshine-vd", "--reason", "Streaming with Sunshine",
+                   "--inhibit-only"])
+    if r.returncode != 0:
+        log(f"warning: could not start the idle inhibitor: {r.stdout.strip()}")
+
+
+def stop_inhibitor():
+    run_quiet(["systemctl", "--user", "stop", INHIBIT_UNIT])
+
+
+def client_request():
+    def num(name, default, cast):
+        try:
+            return cast(float(os.environ.get(name, "")))
+        except ValueError:
+            return default
+    w = num("SUNSHINE_CLIENT_WIDTH", 1920, int)
+    h = num("SUNSHINE_CLIENT_HEIGHT", 1080, int)
+    fps = num("SUNSHINE_CLIENT_FPS", 60.0, float)
+    if fps > 1000:  # some clients send fps * 1000
+        fps /= 1000.0
+    return w, h, fps
+
+
+def cmd_start(args):
+    cfg = load_config()
+    conn = cfg["CONNECTOR"]
+    w, h, fps = client_request()
+    if args.width:
+        w, h, fps = args.width, args.height, args.fps
+    client = os.environ.get("SUNSHINE_CLIENT_NAME", "?")
+    log(f"start: client '{client}' requested {w}x{h}@{fps:g}")
+    if not conn:
+        log("error: CONNECTOR is not set in ~/.config/sunshine-vd/config")
+        return 0
+    try:
+        mutter = Mutter()
+        if truthy(cfg["WAKE_DISPLAYS"]):
+            try:
+                if mutter.get_power_save() not in (0, -1):
+                    mutter.set_power_save(0)
+                    log("displays woken up (PowerSaveMode=0)")
+                    time.sleep(1.0)
+            except Exception as exc:  # noqa: BLE001
+                log(f"warning: could not wake the displays: {exc}")
+
+        st = None
+        for _ in range(10):
+            st = mutter.state()
+            if find_monitor(st, conn):
+                break
+            time.sleep(0.5)
+        vmon = find_monitor(st, conn)
+        if not vmon:
+            log(f"error: GNOME does not see the virtual display {conn}. Did you reboot after "
+                "installing? Run 'sunshine-vd doctor'. Streaming the current display instead.")
+            return 0
+
+        prev = read_state()
+        if prev and has_other_monitors(prev.get("snapshot"), conn):
+            if not prev.get("active"):
+                prev["active"] = True
+                write_state(prev)
+        else:
+            write_state({"active": True, "snapshot": snapshot(st), "connector": conn,
+                         "started": time.time()})
+
+        mode = choose_mode(vmon["modes"], w, h, fps)
+        if not mode:
+            log("error: the virtual display has no usable modes")
+            return 0
+        scale = choose_scale(mode, cfg["SCALE"])
+
+        if truthy(cfg["DISABLE_PHYSICAL"]):
+            lms = [{"x": 0, "y": 0, "scale": scale, "transform": 0, "primary": True,
+                    "monitors": [(conn, mode["id"])]}]
+        else:
+            others = snapshot_to_config(snapshot(st), st, exclude=(conn,))
+            right = 0
+            for lm in others:
+                c, mid = lm["monitors"][0]
+                md = next(m for m in find_monitor(st, c)["modes"] if m["id"] == mid)
+                lw, _ = logical_size(md, lm["scale"], st["layout_mode"])
+                right = max(right, lm["x"] + lw)
+                lm["primary"] = False
+            lms = others + [{"x": right, "y": 0, "scale": scale, "transform": 0,
+                             "primary": True, "monitors": [(conn, mode["id"])]}]
+
+        last_exc = None
+        for _ in range(3):
+            try:
+                mutter.apply(lms, method=1)
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001  (stale serial, monitors changing)
+                last_exc = exc
+                time.sleep(0.5)
+        if last_exc:
+            log(f"error: GNOME rejected the configuration: {last_exc}")
+            return 0
+        log(f"virtual display {conn} set to {mode['width']}x{mode['height']}@{mode['refresh']:.3f} "
+            f"scale {scale:g}{'' if truthy(cfg['DISABLE_PHYSICAL']) else ' (next to the physical displays)'}")
+
+        if truthy(cfg["INHIBIT_IDLE"]):
+            start_inhibitor()
+
+        deadline = time.time() + 5
+        while time.time() < deadline and sysfs_connector_enabled(conn) is False:
+            time.sleep(0.2)
+        try:
+            time.sleep(float(cfg["SETTLE_SECONDS"]))
+        except ValueError:
+            time.sleep(1.5)
+    except Exception as exc:  # noqa: BLE001
+        log(f"unexpected error in start: {exc!r}")
+    return 0
+
+
+def restore_displays(mutter, conn, snap):
+    st = mutter.state()
+    attempts = []
+    if snap:
+        cfg = snapshot_to_config(snap, st, exclude=(conn,))
+        if cfg:
+            attempts.append(("snapshot", cfg, snap.get("layout_mode")))
+    lin = linear_config(st, exclude=(conn,))
+    if lin:
+        attempts.append(("side by side", lin, None))
+    if not attempts:
+        log("no physical display is connected: leaving the virtual display on "
+            "(GNOME turns it off once a real monitor shows up)")
+        return False
+    for name, cfg, layout in attempts:
+        try:
+            mutter.apply(cfg, method=1, layout_mode=layout)
+            log(f"displays restored ({name})")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log(f"warning: could not restore ({name}): {exc}")
+            time.sleep(0.5)
+    return False
+
+
+def cmd_stop(args):
+    cfg = load_config()
+    conn = cfg["CONNECTOR"]
+    log("stop")
+    stop_inhibitor()
+    state = read_state()
+    try:
+        mutter = Mutter()
+        if not state:
+            st = mutter.state()
+            active = {c for lm in st["logical"] for c in lm["connectors"]}
+            if conn not in active:
+                log("nothing to restore (no stream state and the virtual display is off)")
+                return 0
+        ok = restore_displays(mutter, conn, state.get("snapshot") if state else None)
+        if ok:
+            try:
+                STATE_FILE.unlink()
+            except FileNotFoundError:
+                pass
+        elif state:
+            state["active"] = False
+            write_state(state)
+    except Exception as exc:  # noqa: BLE001
+        log(f"unexpected error in stop: {exc!r}")
+    return 0
+
+
+# -------------------------------------------------------- idle / info
+
+
+def cmd_save_layout(args):
+    """Save the current layout (run by the installer before the reboot, while the
+    virtual display does not exist yet) so 'idle' can put it back exactly."""
+    cfg = load_config()
+    st = Mutter().state()
+    exclude = {c for c in (cfg["CONNECTOR"], forced_connector()) if c}
+    snap = snapshot(st)
+    snap["logical"] = [lm for lm in snap["logical"]
+                       if not any(m[0] in exclude for m in lm["monitors"])]
+    if not snap["logical"]:
+        print("no layout to save (no active physical display)")
+        return 1
+    LAYOUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LAYOUT_FILE.write_text(json.dumps(snap, indent=1))
+    print(f"display layout saved to {LAYOUT_FILE}")
+    return 0
+
+
+def cmd_idle(args):
+    """Persist a GNOME layout where the virtual display is OFF outside streams."""
+    cfg = load_config()
+    conn = cfg["CONNECTOR"]
+    mutter = Mutter()
+    st = mutter.state()
+    if not find_monitor(st, conn):
+        print(f"GNOME does not see {conn}: you have not rebooted yet or the EDID did not load. "
+              "Run 'sunshine-vd doctor'.")
+        return 1
+    attempts = []
+    try:
+        saved = json.loads(LAYOUT_FILE.read_text())
+        attempts.append(("your layout from before the reboot",
+                         snapshot_to_config(saved, st, exclude=(conn,)), saved.get("layout_mode")))
+    except (FileNotFoundError, ValueError):
+        pass
+    attempts.append(("the current layout without the virtual display",
+                     snapshot_to_config(snapshot(st), st, exclude=(conn,)), st["layout_mode"]))
+    attempts.append(("all monitors side by side", linear_config(st, exclude=(conn,)), None))
+    before = MONITORS_XML.stat().st_mtime if MONITORS_XML.exists() else 0
+    used = None
+    for name, lms, layout in attempts:
+        if not lms:
+            continue
+        try:
+            mutter.apply(lms, method=2, layout_mode=layout)
+            used = name
+            break
+        except Exception as exc:  # noqa: BLE001
+            log(f"idle: could not apply {name}: {exc}", also_stderr=False)
+    if not used:
+        print("Could not apply a layout without the virtual display. Use GNOME Settings > "
+              f"Displays to turn off '{conn}' (Sunshine VD) and keep the changes.")
+        return 1
+    print(f"Applied {used}. GNOME will ask \"Keep these display settings?\": choose KEEP CHANGES.")
+    if args.no_wait:
+        return 0
+    print("Waiting 25 s to confirm it was saved...")
+    time.sleep(25)
+    st = mutter.state()
+    active = {c for lm in st["logical"] for c in lm["connectors"]}
+    after = MONITORS_XML.stat().st_mtime if MONITORS_XML.exists() else 0
+    if conn in active or after <= before:
+        print("The change was not saved (reverted or not confirmed). Run 'sunshine-vd idle' again.")
+        return 1
+    print(f"Confirmed: {conn} stays off outside streams.")
+    return 0
+
+
+def cmd_status(args):
+    cfg = load_config()
+    conn = cfg["CONNECTOR"]
+    mutter = Mutter()
+    st = mutter.state()
+    active = {c for lm in st["logical"] for c in lm["connectors"]}
+    print(f"sunshine-vd {VERSION} — virtual connector: {conn or '(not configured)'}")
+    for mon in st["monitors"]:
+        md = current_mode(mon)
+        tag = "virtual " if mon["connector"] == conn else "physical"
+        on = "ON " if mon["connector"] in active else "off"
+        cur = f"{md['width']}x{md['height']}@{md['refresh']:.2f}" if md else "-"
+        print(f"  [{tag}] {mon['connector']:<10} {on} {cur:<20} {mon['display_name']}")
+    s = read_state()
+    print(f"stream active (per sunshine-vd): {'yes' if s and s.get('active') else 'no'}")
+    r = run_quiet(["systemctl", "--user", "is-active", INHIBIT_UNIT])
+    print(f"idle inhibitor: {r.stdout.strip() or 'inactive'}")
+    return 0
+
+
+def cmd_modes(args):
+    cfg = load_config()
+    mutter = Mutter()
+    st = mutter.state()
+    mon = find_monitor(st, args.connector or cfg["CONNECTOR"])
+    if not mon:
+        print("Monitor not found.")
+        return 1
+    for md in mon["modes"]:
+        flags = ("*" if md["current"] else " ") + ("+" if md["preferred"] else " ")
+        scales = ",".join(f"{s:g}" for s in md["scales"])
+        print(f" {flags} {md['id']:<24} scales: {scales}")
+    if args.test:
+        w, h, fps = args.test
+        m = choose_mode(mon["modes"], int(w), int(h), float(fps))
+        print(f"for {int(w)}x{int(h)}@{float(fps):g} it would pick: {m['id'] if m else 'nothing'}")
+    return 0
+
+
+def unit_from_cgroup(cgroup_text):
+    """The systemd unit a process runs in: the last cgroup path component if it
+    is a .service ("" for a .scope, e.g. something started from a terminal)."""
+    for line in reversed(cgroup_text.strip().splitlines()):
+        m = re.search(r"/([^/\s]+\.service)$", line.strip())
+        if m and not m.group(1).startswith("user@"):
+            return m.group(1)
+    return ""
+
+
+def sunshine_processes():
+    """[(pid, systemd unit or '')] for Sunshine processes owned by this user."""
+    out = []
+    uid = os.getuid()
+    for p in Path("/proc").glob("[0-9]*"):
+        try:
+            if p.stat().st_uid != uid or (p / "comm").read_text().strip() != "sunshine":
+                continue
+            cg = (p / "cgroup").read_text()
+        except OSError:
+            continue
+        out.append((int(p.name), unit_from_cgroup(cg)))
+    return out
+
+
+def cmd_doctor(args):
+    cfg = load_config()
+    conn = cfg["CONNECTOR"]
+    ok = True
+
+    def check(cond, good, bad):
+        nonlocal ok
+        print(("  OK    " if cond else "  FAIL  ") + (good if cond else bad))
+        ok = ok and cond
+
+    print(f"sunshine-vd {VERSION}")
+    check(bool(conn), f"connector configured: {conn}", "CONNECTOR is not set in ~/.config/sunshine-vd/config")
+    cmdline = read_text(PROC_CMDLINE)
+    check(f"video={conn}:e" in cmdline and "drm.edid_firmware=" in cmdline,
+          "kernel parameters active",
+          f"video={conn}:e / drm.edid_firmware are not on the running kernel's command line (reboot?)")
+    check(EDID_PATH.exists(), f"EDID installed at {EDID_PATH}", f"{EDID_PATH} is missing")
+    c = next((c for c in list_connectors() if c["name"] == conn), None)
+    check(c is not None and c["status"] == "connected",
+          f"the kernel sees {conn} as connected ({c['vendor'] if c else '?'} GPU)",
+          f"{conn} is '{c['status'] if c else 'missing'}' for the kernel "
+          "(EDID not loaded? check: sudo dmesg | grep -i edid)")
+    try:
+        st = Mutter().state()
+        check(find_monitor(st, conn) is not None, f"GNOME sees the virtual display {conn}",
+              f"GNOME does not see {conn}")
+    except Exception as exc:  # noqa: BLE001
+        check(False, "", f"could not talk to GNOME over D-Bus: {exc}")
+    sconf = sunshine_conf_path(cfg)
+    conf = read_text(sconf)
+    check("sunshine-vd start" in conf, f"Sunshine runs sunshine-vd on stream start/stop ({sconf})",
+          f"global_prep_cmd in {sconf} does not call sunshine-vd")
+    check(re.search(r"^\s*capture\s*=\s*kms\s*$", conf, re.M) is not None,
+          "Sunshine captures with KMS", "capture is not set to kms")
+    procs = sunshine_processes()
+    units = sorted({u or "(no unit)" for _, u in procs})
+    check(len(procs) <= 1,
+          f"Sunshine running: {len(procs)} instance(s) {units if procs else ''}".rstrip(),
+          f"{len(procs)} Sunshine instances are running ({', '.join(units)}): only one can own "
+          "the ports. Disable the extra one, e.g. systemctl --user disable --now <unit>")
+    check(shutil.which("gnome-session-inhibit") is not None, "gnome-session-inhibit available",
+          "gnome-session-inhibit is missing (package gnome-session)")
+    logf = sconf.parent / "sunshine.log"
+    if logf.exists():
+        text = logf.read_text(errors="replace")
+        check("Address already in use" not in text, "Sunshine's last start bound its ports",
+              "Sunshine's log says 'Address already in use': another Sunshine is running")
+        lines = [ln.rstrip() for ln in text.splitlines()
+                 if ("Monitor " in ln and " is " in ln) or "Mapped '" in ln or "Couldn't map" in ln]
+        if lines:
+            print("  latest Sunshine lines about displays:")
+            for ln in lines[-6:]:
+                print("     " + ln)
+    if LOG_FILE.exists():
+        print("  latest sunshine-vd log lines:")
+        for ln in LOG_FILE.read_text(errors="replace").splitlines()[-8:]:
+            print("     " + ln)
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------- sunshine.conf
+
+
+def read_conf_lines(path):
+    try:
+        return path.read_text().splitlines()
+    except FileNotFoundError:
+        return []
+
+
+def conf_entries(lines):
+    """Parse sunshine.conf the way Sunshine does (src/config.cpp parse_option):
+    `key = value`, '#' starts a comment anywhere on a line, and a value that
+    starts with '[' runs until the matching ']' even across lines.
+    Returns [(key, first_line, last_line, value)]."""
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        content = line.split("#", 1)[0]
+        if "=" not in content:
+            i += 1
+            continue
+        key, _, rest = content.partition("=")
+        key = key.strip()
+        value = rest.lstrip(" \t")
+        if not key or not value.strip():
+            i += 1
+            continue
+        first = i
+        if value.startswith("["):
+            # Count brackets on the raw text, like Sunshine's skip_list().
+            raw = line[line.index("=") + 1:].lstrip(" \t")
+            depth, parts, j = 0, [], i
+            seg = raw
+            while True:
+                closed_at = None
+                for k, ch in enumerate(seg):
+                    if ch == "[":
+                        depth += 1
+                    elif ch == "]":
+                        depth -= 1
+                        if depth == 0:
+                            closed_at = k
+                            break
+                if closed_at is not None:
+                    parts.append(seg[:closed_at + 1].split("#", 1)[0])
+                    break
+                parts.append(seg.split("#", 1)[0])
+                if j + 1 >= len(lines):
+                    break
+                j += 1
+                seg = lines[j]
+            value = "\n".join(parts)
+            i = j
+        out.append((key, first, i, value.strip()))
+        i += 1
+    return out
+
+
+def conf_get(lines, key):
+    for (k, _a, _b, v) in conf_entries(lines):
+        if k == key:
+            return v
+    return None
+
+
+def conf_set(lines, key, value):
+    """Set key (None removes it). The first occurrence is replaced in place,
+    other occurrences are removed."""
+    spans = [(a, b) for (k, a, b, _v) in conf_entries(lines) if k == key]
+    out, i, done = [], 0, False
+    starts = {a: b for (a, b) in spans}
+    while i < len(lines):
+        if i in starts:
+            if value is not None and not done:
+                out.append(f"{key} = {value}")
+                done = True
+            i = starts[i] + 1
+            continue
+        out.append(lines[i])
+        i += 1
+    if value is not None and not done:
+        out.append(f"{key} = {value}")
+    return out
+
+
+def prep_cmds(lines, path="sunshine.conf"):
+    raw = conf_get(lines, "global_prep_cmd")
+    try:
+        cmds = json.loads(raw) if raw else []
+        if not isinstance(cmds, list):
+            raise ValueError
+        return cmds
+    except ValueError:
+        raise ValueError(f"cannot parse global_prep_cmd in {path}: {raw!r}") from None
+
+
+def is_ours(cmd):
+    """Our own global_prep_cmd entry: '<...>/sunshine-vd start' / '... stop'."""
+    if not isinstance(cmd, dict):
+        return False
+    do = str(cmd.get("do", "")).strip()
+    undo = str(cmd.get("undo", "")).strip()
+    return bool(re.search(r"(^|/)sunshine-vd start$", do)) and bool(re.search(r"(^|/)sunshine-vd stop$", undo))
+
+
+def cmd_sunshine_conf(args):
+    path = Path(args.file).expanduser() if args.file else sunshine_conf_path()
+    lines = read_conf_lines(path)
+    try:
+        cmds = prep_cmds(lines, path)
+    except ValueError as exc:
+        print(f"error: {exc}. Fix that line (it must be a JSON list) and try again.", file=sys.stderr)
+        return 1
+    if args.action == "check":
+        return 0
+    cmds = [c for c in cmds if not is_ours(c)]
+    if args.action == "add":
+        exe = str(Path(args.bin).expanduser())
+        cmds.append({"do": f"{exe} start", "undo": f"{exe} stop"})
+        lines = conf_set(lines, "global_prep_cmd", json.dumps(cmds, ensure_ascii=False))
+        lines = conf_set(lines, "capture", "kms")
+        lines = conf_set(lines, "output_name", args.connector)
+    else:
+        lines = conf_set(lines, "global_prep_cmd",
+                         json.dumps(cmds, ensure_ascii=False) if cmds else None)
+        # Only put back values we changed and that still hold what we set.
+        if args.restore_output is not None and (
+                args.expect_output is None or conf_get(lines, "output_name") == args.expect_output):
+            lines = conf_set(lines, "output_name", args.restore_output or None)
+        if args.restore_capture is not None and conf_get(lines, "capture") == "kms":
+            lines = conf_set(lines, "capture", args.restore_capture or None)
+    text = "\n".join(lines) + "\n"
+    if args.dry_run:
+        sys.stdout.write(text)
+        return 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return 0
+
+
+def cmd_conf_path(args):
+    print(sunshine_conf_path())
+    return 0
+
+
+def cmd_conf_get(args):
+    path = Path(args.file).expanduser() if args.file else sunshine_conf_path()
+    v = conf_get(read_conf_lines(path), args.key)
+    print(v if v is not None else "")
+    return 0
+
+
+# ------------------------------------------------------------------- main
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="sunshine-vd",
+                                description="On-demand virtual display for Sunshine on GNOME")
+    p.add_argument("--version", action="version", version=VERSION)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("start", help="(called by Sunshine) switch to the virtual display")
+    s.add_argument("--width", type=int)
+    s.add_argument("--height", type=int)
+    s.add_argument("--fps", type=float)
+    s.set_defaults(func=cmd_start)
+
+    s = sub.add_parser("stop", help="(called by Sunshine) restore your displays")
+    s.set_defaults(func=cmd_stop)
+
+    s = sub.add_parser("idle", help="persist a layout with the virtual display off (run once)")
+    s.add_argument("--no-wait", action="store_true")
+    s.set_defaults(func=cmd_idle)
+
+    s = sub.add_parser("save-layout", help="(installer) remember the current display layout")
+    s.set_defaults(func=cmd_save_layout)
+
+    s = sub.add_parser("status", help="show the displays and their state")
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("modes", help="list the modes GNOME offers for the virtual display")
+    s.add_argument("--connector")
+    s.add_argument("--test", nargs=3, metavar=("W", "H", "FPS"),
+                   help="show which mode a client asking for WxH@FPS would get")
+    s.set_defaults(func=cmd_modes)
+
+    s = sub.add_parser("connectors", help="list the GPU's connectors")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--pick", action="store_true", help="print the connector the installer would use")
+    g.add_argument("--validate", metavar="NAME", help="exit 0 if NAME exists and is free")
+    g.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_connectors)
+
+    s = sub.add_parser("doctor", help="run diagnostics")
+    s.set_defaults(func=cmd_doctor)
+
+    s = sub.add_parser("make-edid", help="generate the EDID")
+    s.add_argument("--modes", default=DEFAULT_MODES)
+    s.add_argument("--name", default="Sunshine VD")
+    s.add_argument("--out", required=True)
+    s.set_defaults(func=cmd_make_edid)
+
+    s = sub.add_parser("sunshine-conf", help="(installer) edit sunshine.conf")
+    s.add_argument("action", choices=["add", "remove", "check"])
+    s.add_argument("--bin", default=str(HOME / ".local" / "bin" / "sunshine-vd"))
+    s.add_argument("--connector", default="")
+    s.add_argument("--file")
+    s.add_argument("--restore-output")
+    s.add_argument("--restore-capture")
+    s.add_argument("--expect-output", help="remove: only restore output_name if it still equals this")
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(func=cmd_sunshine_conf)
+
+    s = sub.add_parser("conf-path", help="(installer) print the sunshine.conf path in use")
+    s.set_defaults(func=cmd_conf_path)
+
+    s = sub.add_parser("conf-get", help="(installer) read a key from sunshine.conf")
+    s.add_argument("key")
+    s.add_argument("--file")
+    s.set_defaults(func=cmd_conf_get)
+
+    args = p.parse_args(argv)
+    if args.cmd == "start" and args.width and not (args.height and args.fps):
+        p.error("--width requires --height and --fps")
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
