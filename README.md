@@ -8,6 +8,9 @@ It does what [Apollo](https://github.com/ClassicOldSong/Apollo)'s virtual displa
 
 _[Leer en castellano](README.es.md)_
 
+<p align="center"><img src="docs/figures/fig1-how-it-works.svg" width="92%" alt="Diagram: a Moonlight client launches a stream; Sunshine runs sunshine-vd start, which asks GNOME's DisplayConfig API to make the forced-on DP-3 connector the only output at the client's mode; your monitor turns off and Sunshine captures the virtual display over KMS."></p>
+<p align="center"><sub>What happens when a client connects. Quitting the app runs <code>sunshine-vd stop</code>, which restores your saved layout.</sub></p>
+
 <!-- TODO: add docs/demo.gif — a client connecting, the monitor turning off, and everything coming back on quit. -->
 
 ## Status

@@ -8,6 +8,9 @@ Es lo que hace la pantalla virtual de [Apollo](https://github.com/ClassicOldSong
 
 _[Read in English](README.md)_
 
+<p align="center"><img src="docs/figures/fig1-how-it-works.svg" width="92%" alt="Diagrama: un cliente de Moonlight lanza un stream; Sunshine corre sunshine-vd start, que le pide a la API DisplayConfig de GNOME que deje como única salida el conector DP-3 forzado, en el modo del cliente; tu monitor se apaga y Sunshine captura la pantalla virtual por KMS."></p>
+<p align="center"><sub>Qué pasa cuando se conecta un cliente. Al salir de la app, <code>sunshine-vd stop</code> restaura tu configuración guardada.</sub></p>
+
 ## Estado
 
 | | |
